@@ -256,10 +256,11 @@ class VMX_vcp(vrnetlab.VM):
 
 
 class VMX_vfpc(vrnetlab.VM):
-    def __init__(self, version):
+    def __init__(self, version, meshnet=False):
         super(VMX_vfpc, self).__init__(None, None, disk_image = "/vmx/vfpc.img", num=1)
         self.version = version
         self.num_nics = 96
+        self.meshnet = meshnet
 
         self.nic_type = "virtio-net-pci"
         self.qemu_args.extend(["-cpu", "SandyBridge", "-M", "pc", "-smp", "3"])
@@ -324,7 +325,7 @@ class VMX(vrnetlab.VR):
     """ Juniper vMX router
     """
 
-    def __init__(self, username, password, custom_config=False):
+    def __init__(self, username, password, meshnet=False, custom_config=False):
         self.version = None
         self.version_info = []
         self.read_version()
@@ -332,7 +333,7 @@ class VMX(vrnetlab.VR):
         super(VMX, self).__init__(username, password)
 
         self.vms = [VMX_vcp(username, password, "/vmx/" + self.vcp_image, custom_config=custom_config),
-                    VMX_vfpc(self.version)]
+                    VMX_vfpc(self.version, meshnet=meshnet)]
 
         # set up bridge for connecting VCP with vFPC
         vrnetlab.run_command(["brctl", "addbr", "int_cp"])
@@ -405,6 +406,7 @@ if __name__ == '__main__':
     parser.add_argument('--username', default='vrnetlab', help='Username')
     parser.add_argument('--password', default='VR-netlab9', help='Password')
     parser.add_argument('--install', action='store_true', help='Install vMX')
+    parser.add_argument('--meshnet', action='store_true', help='Native docker networking mode')
     parser.add_argument('--custom_config', action='store_true', help='Does user have custom router configuration file')
     args = parser.parse_args()
 
@@ -420,5 +422,5 @@ if __name__ == '__main__':
         vr = VMX_installer(args.username, args.password)
         vr.install()
     else:
-        vr = VMX(args.username, args.password, custom_config=args.custom_config)
+        vr = VMX(args.username, args.password, meshnet=args.meshnet, custom_config=args.custom_config)
         vr.start()
