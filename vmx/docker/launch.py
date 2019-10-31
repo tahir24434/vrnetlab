@@ -8,12 +8,15 @@ import re
 import signal
 import subprocess
 import sys
-import telnetlib
 import time
-
-import IPy
-
 import vrnetlab
+import shutil
+import tarfile
+from textwrap import dedent
+from os import path
+from tempfile import mkdtemp, mkstemp
+from typing import Any, Dict, Iterable, List
+from time import sleep
 
 def handle_SIGCHLD(signal, frame):
     os.waitpid(-1, os.WNOHANG)
@@ -36,18 +39,103 @@ logging.Logger.trace = trace
 
 
 class VMX_vcp(vrnetlab.VM):
-    def __init__(self, username, password, image, install_mode=False):
+    def __init__(self, username, password, image, install_mode=False, custom_config=False):
         super(VMX_vcp, self).__init__(username, password, disk_image=image, ram=2048)
         self.install_mode = install_mode
         self.num_nics = 0
         self.qemu_args.extend(["-drive", "if=ide,file=/vmx/vmxhdd.img"])
         self.smbios = ["type=0,vendor=Juniper",
                        "type=1,manufacturer=Juniper,product=VM-vcp_vmx2-161-re-0,version=0.1.0"]
+
+        # If user has custom configuration file, present at given path inside docker container, we'll create our own
+        # image so we can use a junos config file.
+        if custom_config:
+            logger.info("Creating custom config")
+            custom_config_file = "/etc/config"
+            boot_image_path = "/vmx/custom_config.img"
+            if os.path.isfile(custom_config_file):
+                self.create_config_drive(custom_config_file, boot_image_path)
+                self.qemu_args.extend(
+                    ["-usb", "-drive",
+                     "id=custom_usb_disk,media=disk,format=raw,file=/vmx/custom_config.img,if=none",
+                     "-device", "usb-storage,drive=custom_usb_disk"])
         # add metadata image if it exists
-        if os.path.exists("/vmx/metadata-usb-re.img"):
+        elif os.path.exists("/vmx/metadata-usb-re.img"):
             self.qemu_args.extend(
-                ["-usb", "-drive", "id=my_usb_disk,media=disk,format=raw,file=/vmx/metadata-usb-re.img,if=none",
-                 "-device", "usb-storage,drive=my_usb_disk"])
+                ["-usb", "-drive",
+                 "id=vcp_usb_disk,media=disk,format=raw,file=/vmx/metadata-usb-re.img,if=none",
+                 "-device", "usb-storage,drive=vcp_usb_disk"])
+
+    def create_config_drive(self, custom_config_file: str, boot_image_path: str) -> None:
+        """
+        Creates an image holding custom junos config file.
+        This image has a single gzip compressed tar file at /vmm-config.tgz.
+        Inside the tgz are /boot/loader.conf, containing a static bootloader configuration,
+        and /config/juniper.conf containing the input junos_config_file
+        """
+        temp_dir = mkdtemp("configdrive")
+        temp_tgz = mkstemp(suffix=".tgz")[1]
+        os.makedirs(path.join(temp_dir, "boot"))
+        os.makedirs(path.join(temp_dir, "config"))
+
+        # Generate a hardcoded bootloader configuration
+        # This has been validated for  16.1 and 17.2
+        # May need to be different for different versions
+        # Bootload config can be found in vMX tarball within images/metadata-usb-re.img
+        with open(path.join(temp_dir, "boot/loader.conf"), 'w') as f:
+            f.write(dedent("""
+                vmtype="0"
+                vm_retype="RE-VMX"
+                vm_i2cid="0xBAA"
+                vm_chassis_i2cid="161"
+                vm_instance="0"
+                """))
+
+        # Create a tarfile in the right format containing the user-provided config
+        shutil.copyfile(custom_config_file, path.join(temp_dir, "config/juniper.conf"))
+        with tarfile.open(temp_tgz, mode="w:gz") as tar:
+            tar.add(temp_dir, arcname=".")
+
+        self._exec_cmds([
+            # Create the metadata image which'll hold the config, 10MB should be enough
+            'dd if=/dev/zero of="{}" bs=1M count=10'.format(boot_image_path),
+            '/sbin/mkfs.vfat "{}"'.format(boot_image_path),
+        ])
+
+        # Random sleep to avoid mount clashes between containers trying to mount at the same time
+        sleep(random.randrange(0, 20))
+
+        self._exec_cmds([
+            # Copy our configs into the image
+            'mount -o loop "{}" /mnt'.format(boot_image_path),
+            'cp "{}" /mnt/vmm-config.tgz'.format(temp_tgz),
+            'umount /mnt'
+        ])
+
+        # Only delete the files if we reach the end successfully.
+        # Keep them around on errors for debugging.
+        # Since this is all inside an ephemeral docker container (on an ephemeral host)
+        # we don't need to worry about cluttering up the host with old file
+        os.remove(temp_tgz)
+        shutil.rmtree(temp_dir)
+
+    def _exec_cmds(self, cmds: Iterable[str]) -> None:
+        for cmd in cmds:
+            self._exec_cmd(cmd)
+
+    def _exec_cmd(self, cmd: str) -> str:
+        """
+        Execute shell command.
+        Return the stdout if successful or raise exception otherwise
+        :params cmd: shell command
+        :return the output in bytes format
+        """
+        self.logger.info("Executing: %s", cmd)
+        try:
+            return str(subprocess.check_output(cmd, shell=True).decode("utf-8").strip())
+        except Exception as ex:
+            self.logger.error("Failed executing: %s, with exception: %s", cmd, ex)
+            raise
 
 
     def start(self):
@@ -236,14 +324,15 @@ class VMX(vrnetlab.VR):
     """ Juniper vMX router
     """
 
-    def __init__(self, username, password):
+    def __init__(self, username, password, custom_config=False):
         self.version = None
         self.version_info = []
         self.read_version()
 
         super(VMX, self).__init__(username, password)
 
-        self.vms = [ VMX_vcp(username, password, "/vmx/" + self.vcp_image), VMX_vfpc(self.version) ]
+        self.vms = [VMX_vcp(username, password, "/vmx/" + self.vcp_image, custom_config=custom_config),
+                    VMX_vfpc(self.version)]
 
         # set up bridge for connecting VCP with vFPC
         vrnetlab.run_command(["brctl", "addbr", "int_cp"])
@@ -316,6 +405,7 @@ if __name__ == '__main__':
     parser.add_argument('--username', default='vrnetlab', help='Username')
     parser.add_argument('--password', default='VR-netlab9', help='Password')
     parser.add_argument('--install', action='store_true', help='Install vMX')
+    parser.add_argument('--custom_config', action='store_true', help='Does user have custom router configuration file')
     args = parser.parse_args()
 
     LOG_FORMAT = "%(asctime)s: %(module)-10s %(levelname)-8s %(message)s"
@@ -330,5 +420,5 @@ if __name__ == '__main__':
         vr = VMX_installer(args.username, args.password)
         vr.install()
     else:
-        vr = VMX(args.username, args.password)
+        vr = VMX(args.username, args.password, custom_config=args.custom_config)
         vr.start()

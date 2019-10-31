@@ -11,6 +11,7 @@ RUN apt-get update -qy \
     python3-ipy \
     socat \
     qemu-kvm \
+    dosfstools \
  && rm -rf /var/lib/apt/lists/*
 
 COPY vmx /vmx
